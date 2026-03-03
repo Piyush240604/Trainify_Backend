@@ -1,17 +1,17 @@
 from fastapi import FastAPI, HTTPException, status, Depends
-from pydantic import BaseModel, StringConstraints, constr, field_validator
-import bcrypt
-import mysql.connector
-import logging
-from mysql.connector import Error
-from typing import Annotated, Optional
+from pydantic import BaseModel, StringConstraints, field_validator
+from typing import Annotated
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Literal
+import sqlite3
+import bcrypt
+import logging
+import uvicorn
 
 app = FastAPI()
 
-logger = logging.getLogger("trainify")          # or root logger
-logger.setLevel(logging.INFO) 
+logger = logging.getLogger("trainify")
+logger.setLevel(logging.INFO)
 
 # Allow CORS for frontend dev
 app.add_middleware(
@@ -22,25 +22,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MySQL connection config
+DB_PATH = "trainify.db"
+
 def get_db():
+    conn = None
     try:
-        conn = mysql.connector.connect(
-            host="localhost",
-            user="root",           # Change as needed
-            password="root",           # Change as needed
-            database="trainify",
-        )
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
         yield conn
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database connection error: {e}")
     finally:
-        if conn.is_connected():
+        if conn:
             conn.close()
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            age INTEGER,
+            gender TEXT,
+            height INTEGER,
+            weight INTEGER,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            level TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
 
 NameStr = Annotated[str, StringConstraints(max_length=100)]
 UsernameStr = Annotated[str, StringConstraints(max_length=50)]
-LowerStr = Annotated[str, StringConstraints(to_lower=True)]
 
-# Pydantic models
 class SignupData(BaseModel):
     name: NameStr
     age: int
@@ -59,7 +78,6 @@ class SignupData(BaseModel):
 
     @field_validator('age', 'height', 'weight', mode='before')
     def _to_int(cls, v):
-        # allow digit strings from the frontend
         if isinstance(v, str) and v.isdigit():
             return int(v)
         return v
@@ -68,13 +86,15 @@ class LoginInfo(BaseModel):
     username: UsernameStr
     password: str
 
+@app.on_event("startup")
+def on_startup():
+    init_db()
+    logger.info("Initialized sqlite DB")
+
 @app.post("/register")
 def register(data: SignupData, db=Depends(get_db)):
-
     logger.info(f"Attempting registration: {data}")
-
-    cursor = db.cursor(dictionary=True)
-    # Ensure gender and level are lowercase
+    cursor = db.cursor()
     gender = data.gender.lower()
     level = data.level.lower()
     if gender not in ["male", "female", "other"]:
@@ -82,20 +102,17 @@ def register(data: SignupData, db=Depends(get_db)):
     if level not in ["beginner", "intermediate", "advanced"]:
         raise HTTPException(status_code=400, detail="Invalid level")
 
-    # Check if username exists
-    cursor.execute("SELECT id FROM users WHERE username = %s", (data.username,))
+    cursor.execute("SELECT id FROM users WHERE username = ?", (data.username,))
     if cursor.fetchone():
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    # Hash password
     hashed_pw = bcrypt.hashpw(data.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-    # Insert user
     try:
         cursor.execute(
             """
             INSERT INTO users (name, age, gender, height, weight, username, password, level)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data.name,
@@ -109,7 +126,7 @@ def register(data: SignupData, db=Depends(get_db)):
             ),
         )
         db.commit()
-    except Error as e:
+    except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail="Database error: " + str(e))
     finally:
         cursor.close()
@@ -118,15 +135,16 @@ def register(data: SignupData, db=Depends(get_db)):
 
 @app.post("/login")
 def login(data: LoginInfo, db=Depends(get_db)):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE username = %s", (data.username,))
-    user = cursor.fetchone()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (data.username,))
+    row = cursor.fetchone()
     cursor.close()
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid username or password")
 
-    if not bcrypt.checkpw(data.password.encode("utf-8"), user["password"].encode("utf-8")):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+    stored_pw = row["password"]
+    if not bcrypt.checkpw(data.password.encode("utf-8"), stored_pw.encode("utf-8")):
+        raise HTTPException(status_code=400, detail="Invalid username or password")
 
     return {"message": "Login successful!"}
 
@@ -135,5 +153,4 @@ def read_root():
     return {"message": "Welcome to Trainify Backend!"}
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
