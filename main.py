@@ -1,12 +1,14 @@
 from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel, StringConstraints, field_validator
-from typing import Annotated
+from typing import Annotated, Optional, Dict, Any
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Literal
 import sqlite3
 import bcrypt
 import logging
 import uvicorn
+import json
+from datetime import date
 
 app = FastAPI()
 
@@ -54,6 +56,20 @@ def init_db():
         )
         """
     )
+    # new progress table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT NOT NULL,
+            exercise_name TEXT NOT NULL,
+            date_exercised TEXT NOT NULL,
+            reps INTEGER NOT NULL,
+            duration INTEGER NOT NULL,
+            pta_metrics TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -86,10 +102,59 @@ class LoginInfo(BaseModel):
     username: UsernameStr
     password: str
 
+class ProgressData(BaseModel):
+    user_name: NameStr
+    exercise_name: NameStr
+    date_exercised: date
+    reps: int
+    duration: int  # seconds
+    pta_metrics: Optional[Dict[str, Optional[float]]] = None
+
+    @field_validator('reps', 'duration', mode='before')
+    def _to_int(cls, v):
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+        return v
+
 @app.on_event("startup")
 def on_startup():
     init_db()
     logger.info("Initialized sqlite DB")
+
+
+class PTARequest(BaseModel):
+    user_name: NameStr
+    exercise_name: NameStr
+
+@app.post("/pta")
+def get_pta(data: PTARequest, db=Depends(get_db)):
+    """
+    return the stored pta_metrics for the latest entry matching the user/exercise.
+    if nothing is found or the field is empty we return `pta_metrics: None`.
+    """
+    cursor = db.cursor()
+    cursor.execute(
+        """
+        SELECT pta_metrics
+        FROM progress
+        WHERE user_name = ? AND exercise_name = ?
+        ORDER BY date_exercised DESC
+        LIMIT 1
+        """,
+        (data.user_name, data.exercise_name),
+    )
+    row = cursor.fetchone()
+    cursor.close()
+
+    if not row or not row["pta_metrics"]:
+        return {"pta_metrics": None}
+
+    try:
+        metrics = json.loads(row["pta_metrics"])
+    except json.JSONDecodeError:
+        metrics = None
+
+    return {"pta_metrics": metrics}
 
 @app.post("/register")
 def register(data: SignupData, db=Depends(get_db)):
@@ -147,6 +212,37 @@ def login(data: LoginInfo, db=Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid username or password")
 
     return {"message": "Login successful!"}
+
+@app.post("/save-progress")
+def save_progress(data: ProgressData, db=Depends(get_db)):
+    cursor = db.cursor()
+    metrics_json = None
+    if data.pta_metrics is not None:
+        metrics_json = json.dumps(data.pta_metrics)
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO progress
+                (user_name, exercise_name, date_exercised, reps, duration, pta_metrics)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data.user_name,
+                data.exercise_name,
+                data.date_exercised.isoformat(),
+                data.reps,
+                data.duration,
+                metrics_json,
+            ),
+        )
+        db.commit()
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=500, detail="Database error: " + str(e))
+    finally:
+        cursor.close()
+
+    return {"success": True, "message": "Progress saved"}
 
 @app.get("/")
 def read_root():
