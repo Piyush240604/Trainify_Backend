@@ -8,7 +8,20 @@ import bcrypt
 import logging
 import uvicorn
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+import jwt
+
+# JWT Configuration (Store this in an environment variable later!)
+SECRET_KEY = "Trainify-key"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = 30
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 app = FastAPI()
 
@@ -137,12 +150,6 @@ class ProgressData(BaseModel):
             return int(v)
         return v
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    logger.info("Trainify Backend startup complete")
-
-
 class PTARequest(BaseModel):
     user_name: NameStr
     exercise_name: NameStr
@@ -261,34 +268,44 @@ def register(data: SignupData, db=Depends(get_db)):
 
 @app.post("/login")
 def login(data: LoginInfo, db=Depends(get_db)):
-    logger.info(f"[/login] INCOMING REQUEST | Full payload type: {type(data).__name__}")
-    logger.info(f"[/login] INCOMING REQUEST | username type: {type(data.username).__name__} | value: {data.username}")
-    logger.debug(f"[/login] Password received | type: {type(data.password).__name__} | length: {len(data.password)}")
+    logger.info(f"[/login] INCOMING REQUEST | username: {data.username}")
     
     cursor = db.cursor()
     try:
-        logger.debug(f"[/login] Querying user: {data.username}")
         cursor.execute("SELECT * FROM users WHERE username = ?", (data.username,))
         row = cursor.fetchone()
-        logger.debug(f"[/login] Query result type: {type(row).__name__} | User found: {row is not None}")
         
         if not row:
-            logger.warning(f"[/login] User not found: {data.username}")
             raise HTTPException(status_code=400, detail="Invalid username or password")
 
         stored_pw = row["password"]
-        logger.debug(f"[/login] Retrieved password from DB | type: {type(stored_pw).__name__} | length: {len(stored_pw)}")
-        
         password_match = bcrypt.checkpw(data.password.encode("utf-8"), stored_pw.encode("utf-8"))
-        logger.debug(f"[/login] Password verification result | type: {type(password_match).__name__} | match: {password_match}")
         
         if not password_match:
-            logger.warning(f"[/login] Password mismatch for user: {data.username}")
             raise HTTPException(status_code=400, detail="Invalid username or password")
 
+        # 1. Create the JWT Token
+        access_token = create_access_token(data={"sub": data.username})
+
+        # 2. Package the safe user data for the mobile app's offline vault
+        user_profile = {
+            "username": row["username"],
+            "name": row["name"],
+            "age": row["age"],
+            "gender": row["gender"],
+            "height": row["height"],
+            "weight": row["weight"],
+            "level": row["level"]
+        }
+
+        # 3. Send the exact structure React Native is expecting
+        response = {
+            "message": "Login successful!",
+            "token": access_token,
+            "user": user_profile
+        }
+        
         logger.info(f"[/login] Login successful for user: {data.username}")
-        response = {"message": "Login successful!"}
-        logger.info(f"[/login] OUTGOING RESPONSE | Type: {type(response).__name__} | Data: {response}")
         return response
         
     finally:
