@@ -335,13 +335,15 @@ def login(data: LoginInfo, db=Depends(get_db)):
 
 @app.post("/save-progress")
 def save_progress(data: ProgressData, db=Depends(get_db)):
+    logger.info(f"[/save-progress] INCOMING REQUEST | user: {data.user_name} | exercise: {data.exercise_name}")
+    logger.debug(f"[/save-progress] Request payload | reps: {data.reps} | duration: {data.duration}")
 
     exercise_name = data.exercise_name.lower().strip()
-
     cursor = db.cursor()
     metrics_json = json.dumps(data.pta_metrics) if data.pta_metrics else None
 
     try:
+        logger.debug("[/save-progress] Inserting progress into database")
         cursor.execute("""
         INSERT INTO progress
         (user_name, exercise_name, date_exercised, reps, duration, pta_metrics)
@@ -357,10 +359,12 @@ def save_progress(data: ProgressData, db=Depends(get_db)):
         ))
 
         db.commit()
-
+        logger.info(f"[/save-progress] SUCCESS | Progress saved for {data.user_name}")
+        
         return {"success": True}
 
     except sqlite3.Error as e:
+        logger.error(f"[/save-progress] DB ERROR | {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
