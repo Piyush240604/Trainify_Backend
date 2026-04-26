@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel, StringConstraints, field_validator
 from typing import Annotated, Optional, Dict, Any
@@ -23,7 +25,12 @@ def create_access_token(data: dict):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()   # startup
+    yield          # app runs
+    
+app = FastAPI(lifespan=lifespan)
 
 logger = logging.getLogger("trainify")
 logger.setLevel(logging.DEBUG)
@@ -69,41 +76,44 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                age INTEGER,
-                gender TEXT,
-                height INTEGER,
-                weight INTEGER,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                level TEXT
-            )
-            """
+        # USERS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            age INTEGER,
+            gender TEXT,
+            height INTEGER,
+            weight INTEGER,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            level TEXT
         )
-        logger.debug("Users table created/verified")
-        
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS progress (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_name TEXT NOT NULL,
-                exercise_name TEXT NOT NULL,
-                date_exercised TEXT NOT NULL,
-                reps INTEGER NOT NULL,
-                duration INTEGER NOT NULL,
-                pta_metrics TEXT
-            )
-            """
+        """)
+
+        # PROGRESS
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT NOT NULL,
+            exercise_name TEXT NOT NULL,
+            date_exercised TEXT NOT NULL,
+            reps INTEGER NOT NULL,
+            duration INTEGER NOT NULL,
+            pta_metrics TEXT
         )
-        logger.debug("Progress table created/verified")
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_exercise_date
+        ON progress(user_name, exercise_name, date_exercised)
+        """)
+
         conn.commit()
         logger.info("Database initialization complete")
+
     except Exception as e:
-        logger.error(f"Database initialization error | Type: {type(e).__name__} | Error: {e}")
+        logger.error(f"Database init error: {e}")
     finally:
         conn.close()
 
@@ -313,50 +323,138 @@ def login(data: LoginInfo, db=Depends(get_db)):
 
 @app.post("/save-progress")
 def save_progress(data: ProgressData, db=Depends(get_db)):
-    logger.info(f"[/save-progress] INCOMING REQUEST | Full payload type: {type(data).__name__}")
-    logger.info(f"[/save-progress] INCOMING REQUEST | user_name type: {type(data.user_name).__name__} | value: {data.user_name}")
-    logger.info(f"[/save-progress] INCOMING REQUEST | exercise_name type: {type(data.exercise_name).__name__} | value: {data.exercise_name}")
-    logger.info(f"[/save-progress] INCOMING REQUEST | date_exercised type: {type(data.date_exercised).__name__} | value: {data.date_exercised}")
-    logger.info(f"[/save-progress] INCOMING REQUEST | reps type: {type(data.reps).__name__} | value: {data.reps}")
-    logger.info(f"[/save-progress] INCOMING REQUEST | duration type: {type(data.duration).__name__} | value: {data.duration}")
-    logger.debug(f"[/save-progress] INCOMING REQUEST | pta_metrics type: {type(data.pta_metrics).__name__} | value: {data.pta_metrics}")
-    
+
+    exercise_name = data.exercise_name.lower().strip()
+
     cursor = db.cursor()
-    metrics_json = None
-    if data.pta_metrics is not None:
-        metrics_json = json.dumps(data.pta_metrics)
-        logger.debug(f"[/save-progress] Serialized metrics | type: {type(metrics_json).__name__} | value: {metrics_json}")
-    else:
-        logger.debug(f"[/save-progress] No pta_metrics to serialize (None)")
+    metrics_json = json.dumps(data.pta_metrics) if data.pta_metrics else None
 
     try:
-        logger.debug(f"[/save-progress] Inserting progress record into database")
-        cursor.execute(
-            """
-            INSERT INTO progress
-                (user_name, exercise_name, date_exercised, reps, duration, pta_metrics)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data.user_name,
-                data.exercise_name,
-                data.date_exercised.isoformat(),
-                data.reps,
-                data.duration,
-                metrics_json,
-            ),
-        )
-        logger.debug(f"[/save-progress] Execute complete | Rows affected: {cursor.rowcount}")
+        cursor.execute("""
+        INSERT INTO progress
+        (user_name, exercise_name, date_exercised, reps, duration, pta_metrics)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            data.user_name,
+            exercise_name,
+            data.date_exercised.isoformat(),
+            data.reps,
+            data.duration,
+            metrics_json,
+        ))
+
         db.commit()
-        logger.info(f"[/save-progress] Progress saved successfully | user: {data.user_name} | exercise: {data.exercise_name}")
-        
-        response = {"success": True, "message": "Progress saved"}
-        logger.info(f"[/save-progress] OUTGOING RESPONSE | Type: {type(response).__name__} | Data: {response}")
-        return response
-        
+
+        return {"success": True}
+
     except sqlite3.Error as e:
-        logger.error(f"[/save-progress] Database error | Type: {type(e).__name__} | Error: {e}")
-        raise HTTPException(status_code=500, detail="Database error: " + str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+
+# Response Models for stats endpoint
+class StatsBlock(BaseModel):
+    workouts: int
+    reps: int
+    duration: int
+
+class LastWorkout(BaseModel):
+    exercise: Optional[str]
+    date: Optional[str]
+    reps: int
+    duration: int
+
+class StatsResponse(BaseModel):
+    totals: StatsBlock
+    weekly: StatsBlock
+    monthly: StatsBlock
+    last_workout: LastWorkout
+        
+@app.get("/get-stats/{user_name}", response_model=StatsResponse)
+def get_stats(user_name: str, db=Depends(get_db)):
+
+    cursor = db.cursor()
+
+    try:
+        # --- BASIC TOTALS ---
+        cursor.execute("""
+        SELECT 
+            COUNT(*) as total_workouts,
+            COALESCE(SUM(reps), 0) as total_reps,
+            COALESCE(SUM(duration), 0) as total_duration
+        FROM progress
+        WHERE user_name = ?
+        """, (user_name,))
+        
+        totals = cursor.fetchone()
+
+        # --- LAST WORKOUT ---
+        cursor.execute("""
+        SELECT exercise_name, date_exercised, reps, duration
+        FROM progress
+        WHERE user_name = ?
+        ORDER BY date_exercised DESC
+        LIMIT 1
+        """, (user_name,))
+        
+        last = cursor.fetchone()
+
+        # --- WEEKLY STATS ---
+        seven_days_ago = (datetime.utcnow() - timedelta(days=7)).date().isoformat()
+
+        cursor.execute("""
+        SELECT 
+            COUNT(*) as workouts,
+            COALESCE(SUM(reps), 0) as reps,
+            COALESCE(SUM(duration), 0) as duration
+        FROM progress
+        WHERE user_name = ? AND date_exercised >= ?
+        """, (user_name, seven_days_ago))
+
+        weekly = cursor.fetchone()
+
+        # --- MONTHLY STATS ---
+        thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
+
+        cursor.execute("""
+        SELECT 
+            COUNT(*) as workouts,
+            COALESCE(SUM(reps), 0) as reps,
+            COALESCE(SUM(duration), 0) as duration
+        FROM progress
+        WHERE user_name = ? AND date_exercised >= ?
+        """, (user_name, thirty_days_ago))
+
+        monthly = cursor.fetchone()
+
+        # --- SAFE RESPONSE (IMPORTANT) ---
+        response = {
+            "totals": {
+                "workouts": totals["total_workouts"] or 0,
+                "reps": totals["total_reps"] or 0,
+                "duration": totals["total_duration"] or 0,
+            },
+            "weekly": {
+                "workouts": weekly["workouts"] or 0,
+                "reps": weekly["reps"] or 0,
+                "duration": weekly["duration"] or 0,
+            },
+            "monthly": {
+                "workouts": monthly["workouts"] or 0,
+                "reps": monthly["reps"] or 0,
+                "duration": monthly["duration"] or 0,
+            },
+            "last_workout": {
+                "exercise": last["exercise_name"] if last else None,
+                "date": last["date_exercised"] if last else None,
+                "reps": last["reps"] if last else 0,
+                "duration": last["duration"] if last else 0,
+            }
+        }
+
+        return response
+
     finally:
         cursor.close()
 
