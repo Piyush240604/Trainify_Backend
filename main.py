@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel, StringConstraints, field_validator
-from typing import Annotated, Optional, Dict, Any
+from typing import Annotated, List, Optional, Dict, Any
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Literal
 import sqlite3
@@ -370,7 +370,8 @@ class StatsResponse(BaseModel):
     weekly: StatsBlock
     monthly: StatsBlock
     last_workout: LastWorkout
-        
+    worked_days: List[int]
+
 @app.get("/get-stats/{user_name}", response_model=StatsResponse)
 def get_stats(user_name: str, db=Depends(get_db)):
 
@@ -388,6 +389,25 @@ def get_stats(user_name: str, db=Depends(get_db)):
         """, (user_name,))
         
         totals = cursor.fetchone()
+
+        # --- WORKOUT DAYS THIS MONTH (for calendar heatmap) ---
+        now = datetime.now()
+        current_month = f"{now.month:02d}"  # "04"
+        current_year = str(now.year)        # "2026"
+
+        cursor.execute(
+            """
+            SELECT DISTINCT CAST(strftime('%d', date_exercised) AS INTEGER) as day
+            FROM progress
+            WHERE user_name = ?
+            AND strftime('%m', date_exercised) = ?
+            AND strftime('%Y', date_exercised) = ?
+            """,
+            (user_name, current_month, current_year)
+        )
+
+        rows = cursor.fetchall()
+        worked_days = [row["day"] for row in rows] if rows else []
 
         # --- LAST WORKOUT ---
         cursor.execute("""
@@ -450,7 +470,8 @@ def get_stats(user_name: str, db=Depends(get_db)):
                 "date": last["date_exercised"] if last else None,
                 "reps": last["reps"] if last else 0,
                 "duration": last["duration"] if last else 0,
-            }
+            },
+            "worked_days": worked_days
         }
 
         return response
