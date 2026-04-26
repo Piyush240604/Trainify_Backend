@@ -32,17 +32,28 @@ async def lifespan(app: FastAPI):
     
 app = FastAPI(lifespan=lifespan)
 
+import logging
+import sys
+
 logger = logging.getLogger("trainify")
 logger.setLevel(logging.DEBUG)
 
-# Only console handler - no file logging
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+# Prevent duplicate logs
+logger.propagate = False
 
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
+# Clear existing handlers (important in reload / render)
+if logger.hasHandlers():
+    logger.handlers.clear()
 
-logger.addHandler(console_handler)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+handler.setFormatter(formatter)
+
+logger.addHandler(handler)
 
 # Allow CORS for frontend dev
 app.add_middleware(
@@ -174,6 +185,7 @@ def get_pta(data: PTARequest, db=Depends(get_db)):
     logger.info(f"[/pta] INCOMING REQUEST | exercise_name type: {type(data.exercise_name).__name__} | value: {data.exercise_name}")
     
     cursor = db.cursor()
+    exercise_name = data.exercise_name.lower().strip()
     try:
         logger.debug(f"[/pta] Querying progress table for user_name={data.user_name}, exercise_name={data.exercise_name}")
         cursor.execute(
@@ -184,7 +196,7 @@ def get_pta(data: PTARequest, db=Depends(get_db)):
             ORDER BY date_exercised DESC
             LIMIT 1
             """,
-            (data.user_name, data.exercise_name),
+            (data.user_name, exercise_name),
         )
         row = cursor.fetchone()
         logger.debug(f"[/pta] Query result type: {type(row).__name__} | Result: {row}")
@@ -508,4 +520,4 @@ def read_root():
 
 if __name__ == "__main__":
     logger.info("Starting Trainify Backend server")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="debug")
