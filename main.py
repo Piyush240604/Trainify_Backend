@@ -375,10 +375,13 @@ class StatsResponse(BaseModel):
 @app.get("/get-stats/{user_name}", response_model=StatsResponse)
 def get_stats(user_name: str, db=Depends(get_db)):
 
+    logger.info(f"[/get-stats] INCOMING REQUEST | user_name: {user_name}")
+
     cursor = db.cursor()
 
     try:
         # --- BASIC TOTALS ---
+        logger.debug("[/get-stats] Fetching total stats")
         cursor.execute("""
         SELECT 
             COUNT(*) as total_workouts,
@@ -389,11 +392,14 @@ def get_stats(user_name: str, db=Depends(get_db)):
         """, (user_name,))
         
         totals = cursor.fetchone()
+        logger.debug(f"[/get-stats] totals: {dict(totals) if totals else None}")
 
-        # --- WORKOUT DAYS THIS MONTH (for calendar heatmap) ---
+        # --- WORKOUT DAYS THIS MONTH ---
         now = datetime.now()
-        current_month = f"{now.month:02d}"  # "04"
-        current_year = str(now.year)        # "2026"
+        current_month = f"{now.month:02d}"
+        current_year = str(now.year)
+
+        logger.debug(f"[/get-stats] Fetching worked days | month={current_month}, year={current_year}")
 
         cursor.execute(
             """
@@ -408,8 +414,10 @@ def get_stats(user_name: str, db=Depends(get_db)):
 
         rows = cursor.fetchall()
         worked_days = [row["day"] for row in rows] if rows else []
+        logger.debug(f"[/get-stats] worked_days: {worked_days}")
 
         # --- LAST WORKOUT ---
+        logger.debug("[/get-stats] Fetching last workout")
         cursor.execute("""
         SELECT exercise_name, date_exercised, reps, duration
         FROM progress
@@ -419,9 +427,11 @@ def get_stats(user_name: str, db=Depends(get_db)):
         """, (user_name,))
         
         last = cursor.fetchone()
+        logger.debug(f"[/get-stats] last_workout: {dict(last) if last else None}")
 
         # --- WEEKLY STATS ---
         seven_days_ago = (datetime.utcnow() - timedelta(days=7)).date().isoformat()
+        logger.debug(f"[/get-stats] Fetching weekly stats since {seven_days_ago}")
 
         cursor.execute("""
         SELECT 
@@ -433,9 +443,11 @@ def get_stats(user_name: str, db=Depends(get_db)):
         """, (user_name, seven_days_ago))
 
         weekly = cursor.fetchone()
+        logger.debug(f"[/get-stats] weekly: {dict(weekly) if weekly else None}")
 
         # --- MONTHLY STATS ---
         thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
+        logger.debug(f"[/get-stats] Fetching monthly stats since {thirty_days_ago}")
 
         cursor.execute("""
         SELECT 
@@ -447,8 +459,9 @@ def get_stats(user_name: str, db=Depends(get_db)):
         """, (user_name, thirty_days_ago))
 
         monthly = cursor.fetchone()
+        logger.debug(f"[/get-stats] monthly: {dict(monthly) if monthly else None}")
 
-        # --- SAFE RESPONSE (IMPORTANT) ---
+        # --- RESPONSE ---
         response = {
             "totals": {
                 "workouts": totals["total_workouts"] or 0,
@@ -474,9 +487,16 @@ def get_stats(user_name: str, db=Depends(get_db)):
             "worked_days": worked_days
         }
 
+        logger.info(f"[/get-stats] SUCCESS RESPONSE | user={user_name} | data={response}")
+
         return response
 
+    except Exception as e:
+        logger.error(f"[/get-stats] ERROR | Type: {type(e).__name__} | Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch stats")
+
     finally:
+        logger.debug("[/get-stats] Closing cursor")
         cursor.close()
 
 @app.get("/")
